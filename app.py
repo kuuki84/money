@@ -4,19 +4,14 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="KRW FX Dashboard (Streamlit Cloud)", layout="wide")
-st.title("KRW 다중 통화 대시보드 (USD, JPY, EUR, CNY, CAD, AUD, NOK, SEK, GBP)")
+st.set_page_config(page_title="KRW FX Dashboard v2 (Per-Currency Fair)", layout="wide")
+st.title("KRW 다중 통화 대시보드 v2 (통화별 적정환율)")
 
-st.caption("• 데이터 소스: Yahoo Finance (^DXY, KRW=X 등). 실패 시 동봉된 sample_data.csv를 사용합니다. "
-           "• 적정환율은 간단 모델(USDKRW vs DXY의 1년 중앙값 비율)로 산출한 뒤 교차환율로 확장합니다. 학습/리서치용 예시입니다.")
+st.caption("• 통화별 적정환율: 지난 1년간 **KRW/통화 ÷ DXY** 비율의 중앙값 × 현재 DXY.\n"
+           "• 데이터: Yahoo Finance. 실패 시 sample_data.csv 사용. 연구/학습용 예시입니다.")
 
-import datetime as dt
-
-# -----------------------------
-# Data
-# -----------------------------
 @st.cache_data(show_spinner=True)
-def fetch_data():
+def fetch():
     try:
         import yfinance as yf
         ticks = {
@@ -37,38 +32,31 @@ def fetch_data():
             if not df.empty:
                 frames[k] = df["Adj Close"].tz_localize(None)
         if not frames:
-            raise RuntimeError("No data from yfinance")
+            raise RuntimeError("no data")
         idx = sorted(set().union(*[s.index for s in frames.values()]))
         out = pd.DataFrame(index=idx)
         for k, s in frames.items():
             out[k] = s.reindex(idx)
-        out = out.dropna(how="any")
         out.index.name = "date"
-        return out.reset_index()
-    except Exception as e:
-        # Fallback to bundled CSV
+        out = out.dropna(how="any").reset_index()
+        return out
+    except Exception:
         df = pd.read_csv("sample_data.csv", parse_dates=["date"])
-        df = df.dropna(how="any").sort_values("date")
-        return df.reset_index(drop=True)
+        return df.dropna(how="any").sort_values("date").reset_index(drop=True)
 
-df = fetch_data()
+df = fetch()
 if df.empty:
     st.error("데이터 수집 실패")
     st.stop()
 
-# -----------------------------
 # Sidebar
-# -----------------------------
 with st.sidebar:
     period = st.selectbox("기간", ["1년", "6개월", "3개월", "YTD", "전체"], index=0)
     tolerance = st.slider("고/저평가 임계값(%)", 1.0, 10.0, 3.0, 0.5)
     st.markdown("---")
-    st.write("표시 단위: **KRW/1 단위 외화**")
-    st.write("EUR/GBP/AUD은 USD per X (XUSD), CAD/NOK/SEK/CNY/JPY는 USD per 1 USD (USDX)")
+    st.write("표시 단위: KRW / 1단위 외화")
 
-# -----------------------------
-# Period filter
-# -----------------------------
+# Filter period
 today = pd.to_datetime(df["date"]).max()
 if period == "1년":
     start = today - pd.DateOffset(years=1)
@@ -83,61 +71,50 @@ else:
 
 d = df[pd.to_datetime(df["date"]) >= start].copy().reset_index(drop=True)
 
-# -----------------------------
-# Fair value model (USDKRW vs DXY ratio, 1y median)
-# -----------------------------
-def fair_usdkrw_by_dxy(full_df: pd.DataFrame) -> float:
-    one_year_start = pd.to_datetime(full_df["date"]).max() - pd.DateOffset(years=1)
-    base = full_df[pd.to_datetime(full_df["date"]) >= one_year_start].copy()
-    ratio_med = (base["USDKRW"] / base["DXY"]).median()
-    dxy_now = float(full_df["DXY"].iloc[-1])
-    return float(ratio_med * dxy_now)
-
-fair_usdkrw = fair_usdkrw_by_dxy(df)
-usdkrw_now = float(d["USDKRW"].iloc[-1])
-
-# -----------------------------
-# KRW per currency (live & fair) via cross
-# -----------------------------
-def krw_per_currency_row(row):
-    krw = {}
-    usdkrw = row["USDKRW"]
-    krw["USD"] = usdkrw
-    krw["JPY"] = usdkrw / row["USDJPY"]
+# Build KRW per currency series across the dataframe
+def build_krw_series(frame: pd.DataFrame) -> pd.DataFrame:
+    x = frame.copy()
+    # KRW per 1 unit foreign currency
+    out = pd.DataFrame({"date": x["date"]})
+    out["USD"] = x["USDKRW"]
+    out["JPY"] = x["USDKRW"] / x["USDJPY"]
     for k, col in [("CAD","USDCAD"), ("NOK","USDNOK"), ("SEK","USDSEK"), ("CNY","USDCNY")]:
-        krw[k] = usdkrw / row[col]
+        out[k] = x["USDKRW"] / x[col]
     for k, col in [("EUR","EURUSD"), ("GBP","GBPUSD"), ("AUD","AUDUSD")]:
-        krw[k] = usdkrw * row[col]
-    return krw
-
-latest = d.iloc[-1]
-krw_now = krw_per_currency_row(latest)
-
-def krw_fair_from_fair_usdkrw(row, fair_usdkrw):
-    out = {}
-    out["USD"] = fair_usdkrw
-    out["JPY"] = fair_usdkrw / row["USDJPY"]
-    for k, col in [("CAD","USDCAD"), ("NOK","USDNOK"), ("SEK","USDSEK"), ("CNY","USDCNY")]:
-        out[k] = fair_usdkrw / row[col]
-    for k, col in [("EUR","EURUSD"), ("GBP","GBPUSD"), ("AUD","AUDUSD")]:
-        out[k] = fair_usdkrw * row[col]
+        out[k] = x["USDKRW"] * x[col]
+    out["DXY"] = x["DXY"]
     return out
 
-krw_fair = krw_fair_from_fair_usdkrw(latest, fair_usdkrw)
+krw_full = build_krw_series(df)
+krw_view = build_krw_series(d)
 
-# -----------------------------
-# Gap & Score
-# -----------------------------
+# Per-currency fair value from last 1y ratio (KRW/ccy ÷ DXY)
+def fair_per_currency(full_krw_df: pd.DataFrame) -> dict:
+    end = pd.to_datetime(full_krw_df["date"]).max()
+    start = end - pd.DateOffset(years=1)
+    base = full_krw_df[pd.to_datetime(full_krw_df["date"]) >= start].copy()
+    dxy_now = float(full_krw_df["DXY"].iloc[-1])
+    fair = {}
+    for ccy in ["USD","JPY","EUR","CNY","CAD","AUD","NOK","SEK","GBP"]:
+        ratio_median = np.median(base[ccy].values / base["DXY"].values)
+        fair[ccy] = float(ratio_median * dxy_now)
+    return fair
+
+fair_map = fair_per_currency(krw_full)
+
+# Latest row for now values
+latest = krw_view.iloc[-1]
+
 def score_from_gap(gap_pct):
-    x = -gap_pct  # 저평가(음수 gap)일수록 큰 점수
-    base = 50 + (x * 4)  # 1% ≈ 4점
+    x = -gap_pct
+    base = 50 + x * 4
     return float(np.clip(base, 0, 100))
 
-order = ["USD","JPY","EUR","CNY","CAD","AUD","NOK","SEK","GBP"]
 records = []
+order = ["USD","JPY","EUR","CNY","CAD","AUD","NOK","SEK","GBP"]
 for ccy in order:
-    now_v = krw_now[ccy]
-    fair_v = krw_fair[ccy]
+    now_v = float(latest[ccy])
+    fair_v = float(fair_map[ccy])
     gap = (now_v / fair_v - 1) * 100.0
     records.append({
         "통화": ccy,
@@ -149,23 +126,20 @@ for ccy in order:
 
 tbl = pd.DataFrame(records).set_index("통화").loc[order]
 
-st.subheader("현재 환율 vs 적정 환율 vs 괴리율 (%)")
+st.subheader("현재 vs 적정 vs 괴리율 (통화별)")
 st.dataframe(tbl, use_container_width=True)
 
 st.subheader("단기 환차익 점수 순위")
 st.dataframe(tbl.sort_values("단기 점수 (0~100)", ascending=False), use_container_width=True)
 
-# -----------------------------
-# Charts
-# -----------------------------
-st.subheader("원/달러 vs 달러지수 (참고)")
+# Simple ref chart
+st.subheader("참고: 원/달러 vs DXY")
 fig, ax = plt.subplots(figsize=(9,3))
-ax.plot(pd.to_datetime(d["date"]), d["USDKRW"], label="USDKRW (KRW per USD)")
+ax.plot(pd.to_datetime(d["date"]), d["USDKRW"], label="USDKRW")
 ax.set_ylabel("KRW")
 ax2 = ax.twinx()
 ax2.plot(pd.to_datetime(d["date"]), d["DXY"], label="DXY", linestyle="--")
-ax.legend(loc="upper left")
-ax2.legend(loc="upper right")
+ax.legend(loc="upper left"); ax2.legend(loc="upper right")
 st.pyplot(fig)
 
-st.caption("※ 본 앱은 교육/연구용 예시입니다. 투자 책임은 이용자에게 있습니다.")
+st.caption("※ 계산 로직: 통화별 (KRW/통화 ÷ DXY)의 1년 중앙값을 사용하여 적정환율 산정.")
